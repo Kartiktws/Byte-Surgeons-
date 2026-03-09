@@ -13,8 +13,13 @@ from fastapi.responses import FileResponse, RedirectResponse
 from backend.compressor.dicom_reader import DicomReader
 from backend.compressor.metadata_handler import MetadataHandler
 from backend.compressor.wavelet_engine import WaveletEngine
+from backend.compressor.predictor_engine import PredictorEngine
 from backend.compressor.huffman_engine import HuffmanEngine
-from backend.compressor.file_packer import FilePacker
+from backend.compressor.file_packer import (
+    FilePacker,
+    PIXEL_ENCODING_WAVELET,
+    PIXEL_ENCODING_PREDICTOR,
+)
 from backend.compressor.stl_compressor import compress as stl_compress, decompress as stl_decompress
 
 # Output folders: compressed and decompressed files saved here (paths returned to user)
@@ -46,6 +51,7 @@ app.add_middleware(
 reader = DicomReader()
 metadata_handler = MetadataHandler()
 wavelet_engine = WaveletEngine()
+predictor_engine = PredictorEngine()
 huffman_engine = HuffmanEngine()
 file_packer = FilePacker()
 
@@ -79,14 +85,18 @@ async def compress(file: UploadFile = File(...)):
         data = reader.read(str(dcm_path))
         metadata_tags = data["metadata_tags"]
         pixel_array = data["pixel_array"]
-        print("Step 2/5: Compressing metadata...")
+        print("Step 2/5: Compressing metadata (compact JSON + zstd for 80-90%)...")
         metadata_bytes = metadata_handler.compress(metadata_tags)
         meta_ratio = metadata_handler.compression_ratio(metadata_tags, metadata_bytes)
-        print("Step 3/5: Applying Wavelet Transform...")
-        coefficients = wavelet_engine.forward_transform(pixel_array)
-        print("Step 4/5: Huffman encoding...")
-        pixel_bytes, codebook, coeff_metadata = huffman_engine.encode(coefficients)
-        print("Step 5/5: Packing compressed file...")
+        print("Step 3/5: Predictor encoding (JPEG-LS style for 80-90% pixel compression)...")
+        residuals, predictor_metadata = predictor_engine.encode(
+            pixel_array, bits=data["bits"]
+        )
+        print("Step 4/5: Huffman encoding residuals...")
+        pixel_bytes, codebook, coeff_metadata = huffman_engine.encode_residuals(
+            residuals, predictor_metadata
+        )
+        print("Step 5/5: Packing (V4 + zstd)...")
         out_filename = unique_filename("compressed", ".dcmz")
         out_path = COMPRESSED_DIR / out_filename
         num_frames = data.get("num_frames", 1)
@@ -100,6 +110,8 @@ async def compress(file: UploadFile = File(...)):
             cols=data["cols"],
             bits=data["bits"],
             num_frames=num_frames,
+            use_v4=True,
+            pixel_encoding=PIXEL_ENCODING_PREDICTOR,
         )
         compressed_size = out_path.stat().st_size
         ratio_pct = (
@@ -137,14 +149,25 @@ async def decompress(file: UploadFile = File(...)):
         unpacked = file_packer.unpack(str(dcmz_path))
         print("Step 2/4: Decompressing metadata...")
         metadata_tags = metadata_handler.decompress(unpacked["metadata_bytes"])
-        print("Step 3/4: Huffman decoding pixel data...")
-        coefficients = huffman_engine.decode(
-            unpacked["pixel_bytes"],
-            unpacked["codebook"],
-            unpacked["coeff_metadata"],
-        )
-        print("Step 4/4: Inverse Wavelet Transform...")
-        pixel_array = wavelet_engine.inverse_transform(coefficients)
+        pixel_encoding = unpacked.get("pixel_encoding", PIXEL_ENCODING_WAVELET)
+        if pixel_encoding == PIXEL_ENCODING_PREDICTOR:
+            print("Step 3/4: Huffman decoding residuals (predictor path)...")
+            residuals = huffman_engine.decode_residuals(
+                unpacked["pixel_bytes"],
+                unpacked["codebook"],
+                unpacked["coeff_metadata"],
+            )
+            print("Step 4/4: Inverse predictor...")
+            pixel_array = predictor_engine.decode(residuals, unpacked["coeff_metadata"])
+        else:
+            print("Step 3/4: Huffman decoding (wavelet path)...")
+            coefficients = huffman_engine.decode(
+                unpacked["pixel_bytes"],
+                unpacked["codebook"],
+                unpacked["coeff_metadata"],
+            )
+            print("Step 4/4: Inverse Wavelet Transform...")
+            pixel_array = wavelet_engine.inverse_transform(coefficients)
         out_filename = unique_filename("recovered", ".dcm")
         out_dcm = DECOMPRESSED_DIR / out_filename
         reader.reconstruct(metadata_tags, pixel_array, str(out_dcm))
