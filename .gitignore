@@ -56,3 +56,21 @@ htmlcov/
 .nox/
 coverage.xml
 *.cover
+
+# Node / Frontend
+node_modules/
+.next/
+out/
+.pnp
+.pnp.*
+*.tsbuildinfo
+next-env.d.ts
+
+# Logs & debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Vercel
+.vercel
