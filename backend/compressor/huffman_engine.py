@@ -25,6 +25,9 @@ class HuffmanNode:
 # Scale factor to preserve float precision losslessly (2^20 gives ~6 decimal digits)
 COEFF_SCALE = 2**20
 
+# Use delta encoding for integer coefficient stream (much better compression)
+USE_DELTA_FOR_INT = True
+
 
 class HuffmanEngine:
     """Build Huffman tree from coefficient frequencies; encode/decode to bytes."""
@@ -91,27 +94,107 @@ class HuffmanEngine:
             "original_dtype": coefficients_dict["original_dtype"],
         }
 
+    def _coefficients_to_flat_int(self, coefficients_dict: dict) -> np.ndarray:
+        """Flatten one frame's coefficient arrays (int64) in same order as coefficients_to_flat."""
+        parts = []
+        parts.append(coefficients_dict["approximation"].ravel().astype(np.int64))
+        for detail_level in coefficients_dict["details"]:
+            for key in ("H", "V", "D"):
+                parts.append(detail_level[key].ravel().astype(np.int64))
+        return np.concatenate(parts)
+
     def encode(
         self, coefficients_dict: dict
     ) -> Tuple[bytes, Dict[int, str], dict]:
         """
         Encode coefficients to bytes using Huffman.
-        coefficients_dict has "num_frames" and "frames" (list of per-frame coeff dicts).
+        If coefficients_dict has "integer" True, uses integer coeffs + delta encoding for best compression.
         Returns (encoded_bytes, codebook, coeff_metadata).
         """
         num_frames = coefficients_dict["num_frames"]
         frames = coefficients_dict["frames"]
-        # Flatten all frames into one array; build one codebook from all values
-        all_flat = np.concatenate([self.coefficients_to_flat(c) for c in frames])
+        use_integer = coefficients_dict.get("integer", False)
+
+        if use_integer:
+            all_flat = np.concatenate([self._coefficients_to_flat_int(c) for c in frames])
+            values = all_flat.astype(np.int64)
+            if USE_DELTA_FOR_INT:
+                # Delta encoding: first value then differences. Much smaller symbols -> better Huffman.
+                deltas = np.empty_like(values)
+                deltas[0] = values[0]
+                if len(values) > 1:
+                    deltas[1:] = np.diff(values)
+                values = deltas
+        else:
+            all_flat = np.concatenate([self.coefficients_to_flat(c) for c in frames])
+            values = np.round(all_flat * COEFF_SCALE).astype(np.int64)
+
         frame_metadata_list = [self.build_coeff_metadata(c) for c in frames]
-        coeff_metadata = {"num_frames": num_frames, "frames": frame_metadata_list}
-        values = np.round(all_flat * COEFF_SCALE).astype(np.int64)
+        coeff_metadata = {
+            "num_frames": num_frames,
+            "frames": frame_metadata_list,
+            "integer": use_integer,
+            "delta_encoded": use_integer and USE_DELTA_FOR_INT,
+        }
+
         freq = Counter(values.tolist())
         codebook = self.build_codebook(dict(freq))
         code_string = "".join(codebook[int(v)] for v in values.tolist())
         ba = bitarray.bitarray(code_string)
         encoded_bytes = ba.tobytes()
         return encoded_bytes, codebook, coeff_metadata
+
+    def encode_residuals(
+        self, residual_symbols: np.ndarray, predictor_metadata: dict
+    ) -> Tuple[bytes, Dict[int, str], dict]:
+        """
+        Encode predictor residual symbols (flat int array) with Huffman.
+        Used for predictor-based pixel path (80-90% compression).
+        Returns (encoded_bytes, codebook, metadata) with metadata["predictor"] = True.
+        """
+        values = np.asarray(residual_symbols, dtype=np.int64).ravel()
+        freq = Counter(values.tolist())
+        codebook = self.build_codebook(dict(freq))
+        code_string = "".join(codebook[int(v)] for v in values.tolist())
+        ba = bitarray.bitarray(code_string)
+        encoded_bytes = ba.tobytes()
+        meta = dict(predictor_metadata)
+        meta["predictor"] = True
+        meta["n_symbols"] = len(values)
+        return encoded_bytes, codebook, meta
+
+    def decode_residuals(
+        self, encoded_bytes: bytes, codebook: dict, metadata: dict
+    ) -> np.ndarray:
+        """
+        Decode Huffman bytes back to flat array of residual symbols (predictor path).
+        metadata must have "n_symbols" or "num_frames", "rows", "cols" to get count.
+        """
+        n_total = metadata.get("n_symbols")
+        if n_total is None:
+            n_total = (
+                metadata["num_frames"]
+                * metadata["rows"]
+                * metadata["cols"]
+            )
+        reverse_cb = {}
+        for k, v in codebook.items():
+            reverse_cb[v] = int(k) if isinstance(k, str) else k
+        ba = bitarray.bitarray()
+        ba.frombytes(encoded_bytes)
+        bit_str = ba.to01()
+        decoded_values = []
+        i = 0
+        while i < len(bit_str) and len(decoded_values) < n_total:
+            for length in range(1, min(len(bit_str) - i + 1, 64)):
+                chunk = bit_str[i : i + length]
+                if chunk in reverse_cb:
+                    decoded_values.append(reverse_cb[chunk])
+                    i += length
+                    break
+            else:
+                i += 1
+        return np.array(decoded_values, dtype=np.int64)
 
     def count_frame_coeffs(self, frame_meta: dict) -> int:
         """Total number of coefficients for one frame from its metadata."""
@@ -134,6 +217,29 @@ class HuffmanEngine:
                 shape = tuple(ds[key])
                 n = int(np.prod(shape))
                 level[key] = flat[offset : offset + n].reshape(shape).astype(np.float64)
+                offset += n
+            details.append(level)
+        coeff_dict = {
+            "approximation": approximation,
+            "details": details,
+            "original_shape": tuple(frame_meta["original_shape"]),
+            "original_dtype": frame_meta["original_dtype"],
+        }
+        return coeff_dict, offset
+
+    def _decode_one_frame_int(self, flat_float: np.ndarray, flat_int: np.ndarray, offset: int, frame_meta: dict) -> tuple:
+        """Decode one frame for integer path: use flat_int (int64) for coefficient arrays."""
+        approx_shape = tuple(frame_meta["approximation_shape"])
+        n_approx = int(np.prod(approx_shape))
+        approximation = flat_int[offset : offset + n_approx].reshape(approx_shape).astype(np.int64)
+        offset += n_approx
+        details = []
+        for ds in frame_meta["detail_shapes"]:
+            level = {}
+            for key in ("H", "V", "D"):
+                shape = tuple(ds[key])
+                n = int(np.prod(shape))
+                level[key] = flat_int[offset : offset + n].reshape(shape).astype(np.int64)
                 offset += n
             details.append(level)
         coeff_dict = {
@@ -178,13 +284,35 @@ class HuffmanEngine:
                     break
             else:
                 i += 1
-        flat = np.array(decoded_values, dtype=np.float64) / COEFF_SCALE
-        if num_frames == 1 and "frames" not in coeff_metadata:
-            coeff_dict, _ = self.decode_one_frame(flat, 0, coeff_metadata)
-            return {"num_frames": 1, "frames": [coeff_dict]}
-        frames = []
-        offset = 0
-        for frame_meta in frames_meta:
-            coeff_dict, offset = self.decode_one_frame(flat, offset, frame_meta)
-            frames.append(coeff_dict)
-        return {"num_frames": num_frames, "frames": frames}
+
+        use_integer = coeff_metadata.get("integer", False)
+        delta_encoded = coeff_metadata.get("delta_encoded", False)
+
+        if use_integer:
+            flat = np.array(decoded_values, dtype=np.int64)
+            if delta_encoded:
+                flat = np.cumsum(flat)
+            # Decode expects float for legacy path; for integer we use decode_one_frame with int->float view
+            # decode_one_frame reshapes and sets .astype(np.float64). For integer path we need to keep int
+            # and set "integer" on each frame. So we need a variant that keeps int64.
+            flat_float = flat.astype(np.float64)  # same numbers for reshape
+            if num_frames == 1 and "frames" not in coeff_metadata:
+                coeff_dict, _ = self._decode_one_frame_int(flat_float, flat, 0, coeff_metadata)
+                return {"num_frames": 1, "frames": [coeff_dict], "integer": True}
+            frames = []
+            offset = 0
+            for frame_meta in frames_meta:
+                coeff_dict, offset = self._decode_one_frame_int(flat_float, flat, offset, frame_meta)
+                frames.append(coeff_dict)
+            return {"num_frames": num_frames, "frames": frames, "integer": True}
+        else:
+            flat = np.array(decoded_values, dtype=np.float64) / COEFF_SCALE
+            if num_frames == 1 and "frames" not in coeff_metadata:
+                coeff_dict, _ = self.decode_one_frame(flat, 0, coeff_metadata)
+                return {"num_frames": 1, "frames": [coeff_dict]}
+            frames = []
+            offset = 0
+            for frame_meta in frames_meta:
+                coeff_dict, offset = self.decode_one_frame(flat, offset, frame_meta)
+                frames.append(coeff_dict)
+            return {"num_frames": num_frames, "frames": frames}

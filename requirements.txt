@@ -1,10 +1,10 @@
-pydicom==2.4.4
-numpy==1.26.4
-PyWavelets==1.6.0
-fastapi==0.111.0
-uvicorn==0.29.0
-python-multipart==0.0.9
-pytest==8.2.0
-bitarray==2.9.2
-dahuffman==0.5.0
-zstandard==0.22.0
+# pydicom==2.4.4
+# numpy>=1.26.0
+# PyWavelets>=1.6.0
+# fastapi==0.111.0
+# uvicorn==0.29.0
+# python-multipart==0.0.9
+# pytest==8.2.0
+# bitarray>=2.9.0
+# dahuffman>=0.4.0
+zstandard>=0.22.0
