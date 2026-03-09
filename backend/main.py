@@ -62,6 +62,64 @@ def health():
     return {"status": "ok", "version": "1.0.0", "mode": "lossless"}
 
 
+def _safe_compressed_filename(name: str) -> bool:
+    """Allow only compressed_<8 hex>.dcmz (e.g. compressed_73bab97a.dcmz)."""
+    if not name or len(name) > 64:
+        return False
+    name_lower = name.lower()
+    if not name_lower.endswith(".dcmz"):
+        return False
+    base = name_lower[:-5]
+    if not base.startswith("compressed_"):
+        return False
+    hex_part = base[11:]
+    return len(hex_part) == 8 and all(c in "0123456789abcdef" for c in hex_part)
+
+
+def _safe_stl_compressed_filename(name: str) -> bool:
+    """Allow only stl_compressed_<8 hex>.twsc."""
+    if not name or len(name) > 64:
+        return False
+    name_lower = name.lower()
+    if not name_lower.endswith(".twsc"):
+        return False
+    base = name_lower[:-5]
+    if not base.startswith("stl_compressed_"):
+        return False
+    hex_part = base[15:]
+    return len(hex_part) == 8 and all(c in "0123456789abcdef" for c in hex_part)
+
+
+@app.get("/download/compressed/{filename:path}", include_in_schema=False)
+def download_compressed(filename: str):
+    """Download a compressed DICOM file (.dcmz) by name. Filename must be like compressed_xxxxxxxx.dcmz."""
+    if not _safe_compressed_filename(filename):
+        raise HTTPException(400, "Invalid filename")
+    path = COMPRESSED_DIR / filename
+    if not path.is_file():
+        raise HTTPException(404, "File not found")
+    return FileResponse(
+        path=str(path),
+        filename=filename,
+        media_type="application/octet-stream",
+    )
+
+
+@app.get("/download/stl_compressed/{filename:path}", include_in_schema=False)
+def download_stl_compressed(filename: str):
+    """Download a compressed STL file (.twsc) by name."""
+    if not _safe_stl_compressed_filename(filename):
+        raise HTTPException(400, "Invalid filename")
+    path = STL_COMPRESSED_DIR / filename
+    if not path.is_file():
+        raise HTTPException(404, "File not found")
+    return FileResponse(
+        path=str(path),
+        filename=filename,
+        media_type="application/octet-stream",
+    )
+
+
 @app.post("/compress")
 async def compress(file: UploadFile = File(...)):
     """
