@@ -68,13 +68,14 @@ class HuffmanEngine:
         return codebook
 
     def coefficients_to_flat(self, coefficients_dict: dict) -> np.ndarray:
-        """Flatten one frame's coefficient arrays in order into one float64 array."""
+        """Flatten one frame's coefficient arrays in order. Uses float32 to reduce allocation (e.g. ~1M elements)."""
         parts = []
         parts.append(coefficients_dict["approximation"].ravel())
         for detail_level in coefficients_dict["details"]:
             for key in ("H", "V", "D"):
                 parts.append(detail_level[key].ravel())
-        return np.concatenate(parts).astype(np.float64)
+        out = np.concatenate(parts)
+        return out.astype(np.float32) if out.dtype != np.float32 else out
 
     def build_coeff_metadata(self, coefficients_dict: dict) -> dict:
         """Build shape metadata for one frame (for reshape on decode)."""
@@ -93,6 +94,11 @@ class HuffmanEngine:
             "original_shape": list(coefficients_dict["original_shape"]),
             "original_dtype": coefficients_dict["original_dtype"],
         }
+
+    def frame_to_symbols(self, coefficients_dict: dict) -> np.ndarray:
+        """Flatten one frame's coefficients and convert to int64 Huffman symbols (non-integer/lossy path)."""
+        flat = self.coefficients_to_flat(coefficients_dict)
+        return np.round(flat * COEFF_SCALE).astype(np.int64)
 
     def coefficients_to_flat_int(self, coefficients_dict: dict) -> np.ndarray:
         """Flatten one frame's coefficient arrays (int64) in same order as coefficients_to_flat."""
@@ -205,10 +211,10 @@ class HuffmanEngine:
         return n
 
     def decode_one_frame(self, flat: np.ndarray, offset: int, frame_meta: dict) -> tuple:
-        """Decode one frame from flat float array; return (coeff_dict, next_offset)."""
+        """Decode one frame from flat float array; return (coeff_dict, next_offset). Uses float32 to reduce allocation."""
         approx_shape = tuple(frame_meta["approximation_shape"])
         n_approx = int(np.prod(approx_shape))
-        approximation = flat[offset : offset + n_approx].reshape(approx_shape).astype(np.float64)
+        approximation = flat[offset : offset + n_approx].reshape(approx_shape).astype(np.float32)
         offset += n_approx
         details = []
         for ds in frame_meta["detail_shapes"]:
@@ -216,7 +222,7 @@ class HuffmanEngine:
             for key in ("H", "V", "D"):
                 shape = tuple(ds[key])
                 n = int(np.prod(shape))
-                level[key] = flat[offset : offset + n].reshape(shape).astype(np.float64)
+                level[key] = flat[offset : offset + n].reshape(shape).astype(np.float32)
                 offset += n
             details.append(level)
         coeff_dict = {
@@ -306,7 +312,7 @@ class HuffmanEngine:
                 frames.append(coeff_dict)
             return {"num_frames": num_frames, "frames": frames, "integer": True}
         else:
-            flat = np.array(decoded_values, dtype=np.float64) / COEFF_SCALE
+            flat = np.array(decoded_values, dtype=np.float32) / COEFF_SCALE
             if num_frames == 1 and "frames" not in coeff_metadata:
                 coeff_dict, _ = self.decode_one_frame(flat, 0, coeff_metadata)
                 return {"num_frames": 1, "frames": [coeff_dict]}
