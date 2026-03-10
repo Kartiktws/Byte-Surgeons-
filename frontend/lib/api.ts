@@ -85,7 +85,13 @@ function getErrorMessage(err: unknown, fallback: string): string {
   }
 }
 
-export async function compressDicom(file: File): Promise<{ data: CompressResult; result: ResultState }> {
+export type CompressionMode = "lossless" | "lossy";
+
+export async function compressDicom(
+  file: File,
+  mode: CompressionMode = "lossless"
+): Promise<{ data: CompressResult; result: ResultState }> {
+  if (mode === "lossy") return compressDicomLossy(file);
   const form = new FormData();
   form.append("file", file);
   const res = await fetch(`${API_BASE}/compress`, { method: "POST", body: form });
@@ -102,6 +108,34 @@ export async function compressDicom(file: File): Promise<{ data: CompressResult;
       sizeReducedPercent: sizeReduced,
       message:
         "Lossless compression complete. Download the compressed file below, then upload it here to decompress.",
+      details: data,
+      compressedOutputFile: data.output_file,
+    },
+  };
+}
+
+export async function compressDicomLossy(
+  file: File,
+  options?: { Q?: number; threshold_pct?: number }
+): Promise<{ data: CompressResult; result: ResultState }> {
+  const form = new FormData();
+  form.append("file", file);
+  if (options?.Q != null) form.append("Q", String(options.Q));
+  if (options?.threshold_pct != null) form.append("threshold_pct", String(options.threshold_pct));
+  const res = await fetch(`${API_BASE}/compress/lossy`, { method: "POST", body: form });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(getErrorMessage(err, "Lossy compression failed"));
+  }
+  const data: CompressResult = await res.json();
+  const sizeReduced = data.compression_ratio_percent ?? 0;
+  return {
+    data,
+    result: {
+      type: "compress",
+      sizeReducedPercent: sizeReduced,
+      message:
+        "Lossy compression complete. Download the compressed file below, then upload it here to decompress.",
       details: data,
       compressedOutputFile: data.output_file,
     },
@@ -131,11 +165,42 @@ export async function decompressDicom(file: File): Promise<ResultState> {
   };
 }
 
-export async function compressStl(file: File): Promise<{ data: CompressResult; result: ResultState }> {
+/** Quality for advanced STL lossy: high (70% tris), med (45%), low (25%). */
+export type StlLossyQuality = "high" | "med" | "low";
+
+export async function compressStl(
+  file: File,
+  options: { mode?: CompressionMode; bits?: number; quality_level?: StlLossyQuality } = {}
+): Promise<{ data: CompressResult; result: ResultState }> {
+  const { mode = "lossless", bits = 12, quality_level = "med" } = options;
+
+  if (mode === "lossy") {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("quality_level", quality_level);
+    const res = await fetch(`${API_BASE}/stl/compress/lossy`, { method: "POST", body: form });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(getErrorMessage(err, "Lossy compression failed"));
+    }
+    const data: CompressResult = await res.json();
+    return {
+      data,
+      result: {
+        type: "compress",
+        sizeReducedPercent: data.compression_ratio_percent ?? 0,
+        message:
+          "STL lossy compression complete (advanced). Download the compressed file below, then upload it here to decompress.",
+        details: data,
+        compressedOutputFile: data.output_file,
+      },
+    };
+  }
+
   const form = new FormData();
   form.append("file", file);
   form.append("mode", "lossless");
-  form.append("bits", "12");
+  form.append("bits", String(bits));
   const res = await fetch(`${API_BASE}/stl/compress`, { method: "POST", body: form });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
@@ -148,7 +213,7 @@ export async function compressStl(file: File): Promise<{ data: CompressResult; r
       type: "compress",
       sizeReducedPercent: data.compression_ratio_percent ?? 0,
       message:
-        "STL compression complete. Download the compressed file below, then upload it here to decompress.",
+        "STL lossless compression complete. Download the compressed file below, then upload it here to decompress.",
       details: data,
       compressedOutputFile: data.output_file,
     },

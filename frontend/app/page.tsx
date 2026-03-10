@@ -10,6 +10,7 @@ import {
   decompressStl,
   type FileKind,
   type ResultState,
+  type CompressionMode,
 } from "@/lib/api";
 import {
   ActionButtons,
@@ -23,6 +24,7 @@ import {
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [fileKind, setFileKind] = useState<FileKind>(null);
+  const [compressionMode, setCompressionMode] = useState<CompressionMode>("lossless");
   const [isDragging, setIsDragging] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
@@ -113,8 +115,8 @@ export default function Home() {
 
   const runCompressDicom = useCallback(() => {
     if (!file || fileKind !== "dcm") return;
-    run(() => compressDicom(file));
-  }, [file, fileKind, run]);
+    run(() => compressDicom(file, compressionMode));
+  }, [file, fileKind, compressionMode, run]);
 
   const runDecompressDicom = useCallback(() => {
     if (!file || fileKind !== "dcmz") return;
@@ -123,8 +125,8 @@ export default function Home() {
 
   const runCompressStl = useCallback(() => {
     if (!file || fileKind !== "stl") return;
-    run(() => compressStl(file));
-  }, [file, fileKind, run]);
+    run(() => compressStl(file, { mode: compressionMode }));
+  }, [file, fileKind, compressionMode, run]);
 
   const runDecompressStl = useCallback(() => {
     if (!file || fileKind !== "twsc") return;
@@ -142,7 +144,7 @@ export default function Home() {
             Compress or Decompress
           </h1>
           <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-            DICOM and STL files — lossless
+            DICOM and STL — lossless or lossy compression
           </p>
         </header>
 
@@ -166,6 +168,8 @@ export default function Home() {
           <ActionButtons
             fileKind={fileKind}
             disabled={!canAct}
+            compressionMode={compressionMode}
+            onCompressionModeChange={setCompressionMode}
             onCompressDicom={runCompressDicom}
             onDecompressDicom={runDecompressDicom}
             onCompressStl={runCompressStl}
