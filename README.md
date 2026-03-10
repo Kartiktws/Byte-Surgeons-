@@ -16,7 +16,6 @@ Compress and decompress **DICOM** medical images (lossless & lossy) and **STL** 
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/dicom_compressor.git
-cd dicom_compressor
 ```
 
 *(Replace the URL with your actual repo URL if different.)*
