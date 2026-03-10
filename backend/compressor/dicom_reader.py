@@ -104,6 +104,8 @@ class DicomReader:
         rows = int(dataset.Rows)
         cols = int(dataset.Columns)
         bits = int(dataset.BitsAllocated)
+        bits_stored = int(getattr(dataset, "BitsStored", bits))
+        modality = str(getattr(dataset, "Modality", "") or "").strip().upper()
         photometric = str(getattr(dataset, "PhotometricInterpretation", ""))
 
         pixel_spacing = None
@@ -120,6 +122,8 @@ class DicomReader:
             "rows": rows,
             "cols": cols,
             "bits": bits,
+            "bits_stored": bits_stored,
+            "modality": modality or "OT",
             "photometric": photometric,
             "pixel_spacing": pixel_spacing,
         }

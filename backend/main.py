@@ -6,6 +6,8 @@ import tempfile
 import uuid
 from pathlib import Path
 
+import numpy as np
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
@@ -20,6 +22,9 @@ from backend.compressor.file_packer import (
     PIXEL_ENCODING_WAVELET,
     PIXEL_ENCODING_PREDICTOR,
 )
+from backend.compressor.preprocessor import Preprocessor
+from backend.compressor.quantization_engine import QuantizationEngine, default_q_for_modality
+from backend.compressor.thresholder import Thresholder
 from backend.compressor.stl_compressor import compress as stl_compress, decompress as stl_decompress
 
 # Output folders: compressed and decompressed files saved here (paths returned to user)
@@ -38,6 +43,15 @@ def unique_filename(prefix: str, suffix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
 
 
+def _psnr(original, reconstructed, max_val: float = 255.0) -> float:
+    """Compute PSNR in dB. Both arrays should be same shape, uint8 or float."""
+    import numpy as np
+    mse = float(np.mean((np.asarray(original, dtype=np.float64) - np.asarray(reconstructed, dtype=np.float64)) ** 2))
+    if mse <= 0:
+        return 99.0
+    return round(10 * np.log10(max_val ** 2 / mse), 2)
+
+
 app = FastAPI(title="DICOM Lossless Compression API", version="1.0.0")
 
 app.add_middleware(
@@ -54,6 +68,9 @@ wavelet_engine = WaveletEngine()
 predictor_engine = PredictorEngine()
 huffman_engine = HuffmanEngine()
 file_packer = FilePacker()
+preprocessor = Preprocessor()
+quantization_engine = QuantizationEngine()
+thresholder = Thresholder()
 
 
 @app.get("/", include_in_schema=False)
@@ -191,6 +208,104 @@ async def compress(file: UploadFile = File(...)):
         raise HTTPException(500, str(e))
 
 
+@app.post("/compress/lossy")
+async def compress_lossy(
+    file: UploadFile = File(...),
+    Q: int = Form(None),
+    threshold_pct: float = Form(0.05),
+):
+    """
+    Upload a .dcm file; lossy compress (DWT + quantization + thresholding), save to compressed_output,
+    return stats including compression_ratio, PSNR, Q_used, modality.
+    """
+    if not file.filename or not file.filename.lower().endswith(".dcm"):
+        raise HTTPException(400, "Only .dcm files are accepted")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        dcm_path = Path(tmpdir) / "input.dcm"
+        content = await file.read()
+        dcm_path.write_bytes(content)
+        original_size = len(content)
+        data = reader.read(str(dcm_path))
+        metadata_tags = data["metadata_tags"]
+        pixel_array = data["pixel_array"]
+        modality = data.get("modality", "OT")
+        num_frames = data.get("num_frames", 1)
+        rows, cols = data["rows"], data["cols"]
+        bits_original = data.get("bits", 16)
+
+        # Step 1: Preprocess (window + rescale to uint8)
+        normalized = preprocessor.normalize(pixel_array, modality, metadata_tags)
+        # Step 2: Quantize
+        q_val = int(Q) if Q is not None else default_q_for_modality(modality)
+        if q_val < 1:
+            q_val = 1
+        quantized, _ = quantization_engine.quantize(normalized, q_val, modality)
+        quantized_float = quantized.astype("float64")
+        # Step 3: Wavelet transform (float path)
+        coeffs_multi = wavelet_engine.forward_transform(quantized_float)
+        # Step 4: Threshold
+        thresh = max(0.001, min(1.0, float(threshold_pct)))
+        coeffs_thresholded = thresholder.apply_multi(coeffs_multi, thresh)
+        # Step 5: Metadata compression
+        metadata_bytes = metadata_handler.compress(metadata_tags)
+        # Step 6: Huffman encode coefficients
+        pixel_bytes, codebook, coeff_metadata = huffman_engine.encode(coeffs_thresholded)
+        # Step 7: Pack lossy
+        out_filename = unique_filename("compressed", ".dcmz")
+        out_path = COMPRESSED_DIR / out_filename
+        file_packer.pack_lossy(
+            str(out_path),
+            metadata_bytes=metadata_bytes,
+            pixel_bytes=pixel_bytes,
+            codebook=codebook,
+            coeff_metadata=coeff_metadata,
+            rows=rows,
+            cols=cols,
+            bits_original=bits_original,
+            num_frames=num_frames,
+            Q=q_val,
+            wavelet_levels=3,
+            threshold_pct=thresh,
+        )
+        compressed_size = out_path.stat().st_size
+        ratio_pct = (
+            round((1 - compressed_size / original_size) * 100, 2)
+            if original_size > 0 else 0.0
+        )
+        # Optional: round-trip decode to compute PSNR
+        psnr_val = None
+        try:
+            unpacked = file_packer.unpack(str(out_path))
+            meta_dec = metadata_handler.decompress(unpacked["metadata_bytes"])
+            coeffs_dec = huffman_engine.decode(
+                unpacked["pixel_bytes"],
+                unpacked["codebook"],
+                unpacked["coeff_metadata"],
+            )
+            pixel_dec = wavelet_engine.inverse_transform(coeffs_dec)
+            pixel_int = np.round(np.asarray(pixel_dec, dtype=np.float64)).astype(np.int64)
+            reconstructed = quantization_engine.dequantize(pixel_int, unpacked["Q"])
+            psnr_val = _psnr(normalized, reconstructed)
+        except Exception:
+            pass
+        return {
+            "status": "success",
+            "num_frames": num_frames,
+            "original_size_kb": round(original_size / 1024, 2),
+            "compressed_size_kb": round(compressed_size / 1024, 2),
+            "compression_ratio_percent": ratio_pct,
+            "Q_used": q_val,
+            "threshold_pct": thresh,
+            "modality": modality,
+            "output_file": out_filename,
+            "output_path": str(out_path),
+            "PSNR_db": psnr_val,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.post("/decompress")
 async def decompress(file: UploadFile = File(...)):
     """
@@ -207,25 +322,41 @@ async def decompress(file: UploadFile = File(...)):
         unpacked = file_packer.unpack(str(dcmz_path))
         print("Step 2/4: Decompressing metadata...")
         metadata_tags = metadata_handler.decompress(unpacked["metadata_bytes"])
-        pixel_encoding = unpacked.get("pixel_encoding", PIXEL_ENCODING_WAVELET)
-        if pixel_encoding == PIXEL_ENCODING_PREDICTOR:
-            print("Step 3/4: Huffman decoding residuals (predictor path)...")
-            residuals = huffman_engine.decode_residuals(
-                unpacked["pixel_bytes"],
-                unpacked["codebook"],
-                unpacked["coeff_metadata"],
-            )
-            print("Step 4/4: Inverse predictor...")
-            pixel_array = predictor_engine.decode(residuals, unpacked["coeff_metadata"])
-        else:
-            print("Step 3/4: Huffman decoding (wavelet path)...")
+        is_lossy = unpacked.get("is_lossy", False)
+        if is_lossy:
+            print("Step 3/4: Huffman decode + inverse wavelet (lossy path)...")
             coefficients = huffman_engine.decode(
                 unpacked["pixel_bytes"],
                 unpacked["codebook"],
                 unpacked["coeff_metadata"],
             )
-            print("Step 4/4: Inverse Wavelet Transform...")
-            pixel_array = wavelet_engine.inverse_transform(coefficients)
+            pixel_dec = wavelet_engine.inverse_transform(coefficients)
+            pixel_int = np.round(np.asarray(pixel_dec, dtype=np.float64)).astype(np.int64)
+            print("Step 4/4: Dequantize...")
+            pixel_array = quantization_engine.dequantize(pixel_int, unpacked["Q"])
+            # Override bits to 8 for lossy output
+            metadata_tags["0028,0100"] = {"v": "8", "vr": "US"}
+            metadata_tags["0028,0101"] = {"v": "8", "vr": "US"}
+        else:
+            pixel_encoding = unpacked.get("pixel_encoding", PIXEL_ENCODING_WAVELET)
+            if pixel_encoding == PIXEL_ENCODING_PREDICTOR:
+                print("Step 3/4: Huffman decoding residuals (predictor path)...")
+                residuals = huffman_engine.decode_residuals(
+                    unpacked["pixel_bytes"],
+                    unpacked["codebook"],
+                    unpacked["coeff_metadata"],
+                )
+                print("Step 4/4: Inverse predictor...")
+                pixel_array = predictor_engine.decode(residuals, unpacked["coeff_metadata"])
+            else:
+                print("Step 3/4: Huffman decoding (wavelet path)...")
+                coefficients = huffman_engine.decode(
+                    unpacked["pixel_bytes"],
+                    unpacked["codebook"],
+                    unpacked["coeff_metadata"],
+                )
+                print("Step 4/4: Inverse Wavelet Transform...")
+                pixel_array = wavelet_engine.inverse_transform(coefficients)
         out_filename = unique_filename("recovered", ".dcm")
         out_dcm = DECOMPRESSED_DIR / out_filename
         reader.reconstruct(metadata_tags, pixel_array, str(out_dcm))

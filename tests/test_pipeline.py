@@ -111,7 +111,8 @@ def test_full_pipeline_lossless(tmp_path):
     # Read original (pixel_array is 3D (1, rows, cols) for single-frame)
     data = reader.read(dcm_path)
     original_pixels = np.array(data["pixel_array"], copy=True)
-    original_patient_name = data["metadata_tags"].get("0010,0010", "")
+    pn_entry = data["metadata_tags"].get("0010,0010") or {}
+    original_patient_name = pn_entry.get("v", "") if isinstance(pn_entry, dict) else str(pn_entry)
     original_rows = data["rows"]
 
     # Compress

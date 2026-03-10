@@ -19,6 +19,7 @@ MAGIC_V1 = b"DCMZ_V1"
 MAGIC_V2 = b"DCMZ_V2"
 MAGIC_V3 = b"DCMZ_V3"
 MAGIC_V4 = b"DCMZ_V4"
+MAGIC_V4_LOSSY = b"DCMZ_V5"  # Lossy format: Q, threshold_pct, wavelet level in header
 MAGIC = MAGIC_V4  # Current format (best compression)
 PIXEL_ENCODING_WAVELET = 0
 PIXEL_ENCODING_PREDICTOR = 1
@@ -126,6 +127,63 @@ class FilePacker:
             f.write(pixel_bytes)
         return str(path)
 
+    def pack_lossy(
+        self,
+        output_path: str,
+        metadata_bytes: bytes,
+        pixel_bytes: bytes,
+        codebook: dict,
+        coeff_metadata: dict,
+        rows: int,
+        cols: int,
+        bits_original: int,
+        num_frames: int,
+        Q: int,
+        wavelet_levels: int = 3,
+        threshold_pct: float = 0.05,
+    ) -> str:
+        """
+        Write lossy .dcmz file (magic DCMZ_V5). Header includes Q, threshold_pct.
+        Sections (metadata, codebook, coeff_meta, pixel) are zstd-compressed.
+        """
+        codebook_json = json.dumps(codebook, separators=(',', ':'))
+        codebook_bytes = codebook_json.encode("utf-8")
+        coeff_meta_json = json.dumps(coeff_metadata, separators=(',', ':'))
+        coeff_meta_bytes = coeff_meta_json.encode("utf-8")
+
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        use_zstd = _ZSTD_AVAILABLE
+        if use_zstd:
+            pixel_bytes = _compress_section(pixel_bytes, True)
+            codebook_bytes = _compress_section(codebook_bytes, True)
+            coeff_meta_bytes = _compress_section(coeff_meta_bytes, True)
+
+        metadata_size = len(metadata_bytes)
+        codebook_size = len(codebook_bytes)
+        coeff_meta_size = len(coeff_meta_bytes)
+        pixel_size = len(pixel_bytes)
+
+        with open(path, "wb") as f:
+            f.write(MAGIC_V4_LOSSY)
+            f.write(struct.pack("<I", rows))
+            f.write(struct.pack("<I", cols))
+            f.write(struct.pack("<H", bits_original))
+            f.write(struct.pack("<I", num_frames))
+            f.write(struct.pack("<H", min(Q, 0xFFFF)))
+            f.write(struct.pack("<B", wavelet_levels))
+            f.write(struct.pack("<f", float(threshold_pct)))
+            f.write(struct.pack("<I", metadata_size))
+            f.write(struct.pack("<I", codebook_size))
+            f.write(struct.pack("<I", coeff_meta_size))
+            f.write(struct.pack("<I", pixel_size))
+            f.write(metadata_bytes)
+            f.write(codebook_bytes)
+            f.write(coeff_meta_bytes)
+            f.write(pixel_bytes)
+        return str(path)
+
     def unpack(self, input_path: str) -> dict:
         """
         Read .dcmz file and return dict with all components.
@@ -137,24 +195,39 @@ class FilePacker:
             raise FileNotFoundError(f"File not found: {input_path}")
         with open(path, "rb") as f:
             magic = f.read(7)
-            if magic not in (MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4):
+            if magic not in (MAGIC_V1, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V4_LOSSY):
                 raise ValueError("Not a valid DCMZ file")
+            is_lossy = magic == MAGIC_V4_LOSSY
             is_v4 = magic == MAGIC_V4
             is_v3 = magic == MAGIC_V3
             is_v2 = magic == MAGIC_V2
-            rows = struct.unpack("<I", f.read(4))[0]
-            cols = struct.unpack("<I", f.read(4))[0]
-            bits = struct.unpack("<H", f.read(2))[0]
-            wavelet_levels = struct.unpack("<B", f.read(1))[0]
-            if is_v2 or is_v3 or is_v4:
+            if is_lossy:
+                rows = struct.unpack("<I", f.read(4))[0]
+                cols = struct.unpack("<I", f.read(4))[0]
+                bits = struct.unpack("<H", f.read(2))[0]
                 num_frames = struct.unpack("<I", f.read(4))[0]
                 if num_frames == 0:
                     num_frames = 1
+                Q = struct.unpack("<H", f.read(2))[0]
+                wavelet_levels = struct.unpack("<B", f.read(1))[0]
+                threshold_pct = struct.unpack("<f", f.read(4))[0]
+                pixel_encoding = PIXEL_ENCODING_WAVELET
             else:
-                num_frames = 1
-            pixel_encoding = PIXEL_ENCODING_WAVELET
-            if is_v4:
-                pixel_encoding = struct.unpack("<B", f.read(1))[0]
+                rows = struct.unpack("<I", f.read(4))[0]
+                cols = struct.unpack("<I", f.read(4))[0]
+                bits = struct.unpack("<H", f.read(2))[0]
+                wavelet_levels = struct.unpack("<B", f.read(1))[0]
+                if is_v2 or is_v3 or is_v4:
+                    num_frames = struct.unpack("<I", f.read(4))[0]
+                    if num_frames == 0:
+                        num_frames = 1
+                else:
+                    num_frames = 1
+                pixel_encoding = PIXEL_ENCODING_WAVELET
+                if is_v4:
+                    pixel_encoding = struct.unpack("<B", f.read(1))[0]
+                Q = 1
+                threshold_pct = 0.0
             metadata_size = struct.unpack("<I", f.read(4))[0]
             codebook_size = struct.unpack("<I", f.read(4))[0]
             coeff_meta_size = struct.unpack("<I", f.read(4))[0]
@@ -163,8 +236,8 @@ class FilePacker:
             codebook_bytes = f.read(codebook_size)
             coeff_meta_bytes = f.read(coeff_meta_size)
             pixel_bytes = f.read(pixel_size)
-        use_zstd = is_v4 and _ZSTD_AVAILABLE
-        if is_v4 or is_v3:
+        use_zstd = (is_v4 or is_lossy) and _ZSTD_AVAILABLE
+        if is_v4 or is_v3 or is_lossy:
             codebook_bytes = _decompress_section(codebook_bytes, use_zstd)
             coeff_meta_bytes = _decompress_section(coeff_meta_bytes, use_zstd)
             pixel_bytes = _decompress_section(pixel_bytes, use_zstd)
@@ -174,7 +247,7 @@ class FilePacker:
             coeff_metadata["num_frames"] = num_frames
         if "frames" not in coeff_metadata and num_frames == 1 and not coeff_metadata.get("predictor"):
             pass
-        return {
+        result = {
             "rows": rows,
             "cols": cols,
             "bits": bits,
@@ -186,3 +259,8 @@ class FilePacker:
             "coeff_metadata": coeff_metadata,
             "pixel_bytes": pixel_bytes,
         }
+        if is_lossy:
+            result["is_lossy"] = True
+            result["Q"] = Q
+            result["threshold_pct"] = threshold_pct
+        return result
