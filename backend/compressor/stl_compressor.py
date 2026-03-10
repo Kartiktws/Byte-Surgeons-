@@ -767,7 +767,3 @@ def main() -> None:
     print(f"Mode used: {result['mode']}")
     print(f"Triangle count: {result['triangle_count']}")
     print(f"Unique vertex count: {result['unique_vertex_count']}")
-
-
-if __name__ == "__main__":
-    main()
