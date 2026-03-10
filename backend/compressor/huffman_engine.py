@@ -94,7 +94,7 @@ class HuffmanEngine:
             "original_dtype": coefficients_dict["original_dtype"],
         }
 
-    def _coefficients_to_flat_int(self, coefficients_dict: dict) -> np.ndarray:
+    def coefficients_to_flat_int(self, coefficients_dict: dict) -> np.ndarray:
         """Flatten one frame's coefficient arrays (int64) in same order as coefficients_to_flat."""
         parts = []
         parts.append(coefficients_dict["approximation"].ravel().astype(np.int64))
@@ -116,7 +116,7 @@ class HuffmanEngine:
         use_integer = coefficients_dict.get("integer", False)
 
         if use_integer:
-            all_flat = np.concatenate([self._coefficients_to_flat_int(c) for c in frames])
+            all_flat = np.concatenate([self.coefficients_to_flat_int(c) for c in frames])
             values = all_flat.astype(np.int64)
             if USE_DELTA_FOR_INT:
                 # Delta encoding: first value then differences. Much smaller symbols -> better Huffman.
@@ -227,7 +227,7 @@ class HuffmanEngine:
         }
         return coeff_dict, offset
 
-    def _decode_one_frame_int(self, flat_float: np.ndarray, flat_int: np.ndarray, offset: int, frame_meta: dict) -> tuple:
+    def decode_one_frame_int(self, flat_float: np.ndarray, flat_int: np.ndarray, offset: int, frame_meta: dict) -> tuple:
         """Decode one frame for integer path: use flat_int (int64) for coefficient arrays."""
         approx_shape = tuple(frame_meta["approximation_shape"])
         n_approx = int(np.prod(approx_shape))
@@ -297,12 +297,12 @@ class HuffmanEngine:
             # and set "integer" on each frame. So we need a variant that keeps int64.
             flat_float = flat.astype(np.float64)  # same numbers for reshape
             if num_frames == 1 and "frames" not in coeff_metadata:
-                coeff_dict, _ = self._decode_one_frame_int(flat_float, flat, 0, coeff_metadata)
+                coeff_dict, _ = self.decode_one_frame_int(flat_float, flat, 0, coeff_metadata)
                 return {"num_frames": 1, "frames": [coeff_dict], "integer": True}
             frames = []
             offset = 0
             for frame_meta in frames_meta:
-                coeff_dict, offset = self._decode_one_frame_int(flat_float, flat, offset, frame_meta)
+                coeff_dict, offset = self.decode_one_frame_int(flat_float, flat, offset, frame_meta)
                 frames.append(coeff_dict)
             return {"num_frames": num_frames, "frames": frames, "integer": True}
         else:

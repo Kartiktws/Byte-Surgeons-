@@ -7,7 +7,7 @@ import numpy as np
 from typing import Tuple, Dict, Any
 
 
-def _median3(a: int, b: int, c: int) -> int:
+def median3(a: int, b: int, c: int) -> int:
     """Median of three integers (no float)."""
     if a <= b:
         if b <= c:
@@ -18,15 +18,15 @@ def _median3(a: int, b: int, c: int) -> int:
     return b if b <= c else c
 
 
-def _residual_to_symbol(r: int) -> int:
+def residual_to_symbol(r: int) -> int:
     """Map signed residual to non-negative symbol for Huffman. 0->0, -1->1, 1->2, -2->3, 2->4..."""
     if r >= 0:
         return 2 * r
     return -2 * r - 1
 
 
-def _symbol_to_residual(s: int) -> int:
-    """Inverse of _residual_to_symbol."""
+def symbol_to_residual(s: int) -> int:
+    """Inverse of residual_to_symbol."""
     if s % 2 == 0:
         return s // 2
     return -(s // 2 + 1)
@@ -45,14 +45,14 @@ def predict_frame_2d(img: np.ndarray, maxval: int) -> np.ndarray:
             left = img[r, c - 1] if c > 0 else 0
             top = img[r - 1, c] if r > 0 else 0
             topleft = img[r - 1, c - 1] if (r > 0 and c > 0) else 0
-            pred = _median3(left, top, left + top - topleft)
+            pred = median3(left, top, left + top - topleft)
             pred = max(0, min(maxval, pred))
             residual = int(img[r, c] - pred)
-            out[r, c] = _residual_to_symbol(residual)
+            out[r, c] = residual_to_symbol(residual)
     return out.ravel()
 
 
-def _rle_zero_runs(symbols_flat: np.ndarray, max_residual_symbol: int) -> np.ndarray:
+def rle_zero_runs(symbols_flat: np.ndarray, max_residual_symbol: int) -> np.ndarray:
     """
     Replace runs of 2+ zeros with single tokens (max_residual_symbol + run_length).
     Greatly improves compression on smooth/medical images.
@@ -76,7 +76,7 @@ def _rle_zero_runs(symbols_flat: np.ndarray, max_residual_symbol: int) -> np.nda
     return np.array(out, dtype=np.int64)
 
 
-def _rle_zero_runs_inverse(tokens: np.ndarray, max_residual_symbol: int) -> np.ndarray:
+def rle_zero_runs_inverse(tokens: np.ndarray, max_residual_symbol: int) -> np.ndarray:
     """Expand RLE zero runs back to full symbol stream."""
     out = []
     for s in tokens:
@@ -98,9 +98,9 @@ def inverse_predict_frame_2d(symbols_flat: np.ndarray, shape: tuple, maxval: int
             left = out[r, c - 1] if c > 0 else 0
             top = out[r - 1, c] if r > 0 else 0
             topleft = out[r - 1, c - 1] if (r > 0 and c > 0) else 0
-            pred = _median3(left, top, left + top - topleft)
+            pred = median3(left, top, left + top - topleft)
             pred = max(0, min(maxval, pred))
-            residual = _symbol_to_residual(int(symbols[r, c]))
+            residual = symbol_to_residual(int(symbols[r, c]))
             pixel = pred + residual
             # Wrap/clamp to [0, maxval] for lossless
             if pixel < 0:
@@ -112,7 +112,7 @@ def inverse_predict_frame_2d(symbols_flat: np.ndarray, shape: tuple, maxval: int
 
 
 # For 16-bit, max residual symbol = 2*65535 = 131070. RLE uses 131071+ for run lengths.
-def _max_residual_symbol(bits: int) -> int:
+def max_residual_symbol(bits: int) -> int:
     maxval = (1 << bits) - 1
     return 2 * maxval
 
@@ -138,9 +138,9 @@ class PredictorEngine:
             flat = predict_frame_2d(pixel_array[i], maxval)
             frames_flat.append(flat)
         residuals = np.concatenate(frames_flat)
-        max_sym = _max_residual_symbol(bits)
+        max_sym = max_residual_symbol(bits)
         if self.use_rle_zeros:
-            residuals = _rle_zero_runs(residuals, max_sym)
+            residuals = rle_zero_runs(residuals, max_sym)
         metadata = {
             "num_frames": num_frames,
             "rows": R,
@@ -155,8 +155,8 @@ class PredictorEngine:
     def decode(self, residual_symbols: np.ndarray, metadata: dict) -> np.ndarray:
         """Decode residual symbols back to pixel array (3D: num_frames, rows, cols)."""
         if metadata.get("rle_zeros", False):
-            max_sym = _max_residual_symbol(metadata["bits"])
-            residual_symbols = _rle_zero_runs_inverse(residual_symbols, max_sym)
+            max_sym = max_residual_symbol(metadata["bits"])
+            residual_symbols = rle_zero_runs_inverse(residual_symbols, max_sym)
         num_frames = metadata["num_frames"]
         R = metadata["rows"]
         C = metadata["cols"]

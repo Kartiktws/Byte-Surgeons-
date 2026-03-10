@@ -25,14 +25,14 @@ PIXEL_ENCODING_WAVELET = 0
 PIXEL_ENCODING_PREDICTOR = 1
 
 
-def _compress_section(data: bytes, use_zstd: bool) -> bytes:
+def compress_section(data: bytes, use_zstd: bool) -> bytes:
     if use_zstd and _ZSTD_AVAILABLE:
         cctx = zstd.ZstdCompressor(level=22)
         return cctx.compress(data)
     return zlib.compress(data, level=9)
 
 
-def _decompress_section(data: bytes, use_zstd: bool) -> bytes:
+def decompress_section(data: bytes, use_zstd: bool) -> bytes:
     if use_zstd and _ZSTD_AVAILABLE:
         dctx = zstd.ZstdDecompressor()
         return dctx.decompress(data)
@@ -72,9 +72,9 @@ class FilePacker:
 
         use_zstd = use_v4 and _ZSTD_AVAILABLE
         if use_v4 or use_v3:
-            pixel_bytes = _compress_section(pixel_bytes, use_zstd)
-            codebook_bytes = _compress_section(codebook_bytes, use_zstd)
-            coeff_meta_bytes = _compress_section(coeff_meta_bytes, use_zstd)
+            pixel_bytes = compress_section(pixel_bytes, use_zstd)
+            codebook_bytes = compress_section(codebook_bytes, use_zstd)
+            coeff_meta_bytes = compress_section(coeff_meta_bytes, use_zstd)
         if use_v4:
             # Metadata is already compressed by handler (zstd or zlib)
             pass
@@ -156,9 +156,9 @@ class FilePacker:
 
         use_zstd = _ZSTD_AVAILABLE
         if use_zstd:
-            pixel_bytes = _compress_section(pixel_bytes, True)
-            codebook_bytes = _compress_section(codebook_bytes, True)
-            coeff_meta_bytes = _compress_section(coeff_meta_bytes, True)
+            pixel_bytes = compress_section(pixel_bytes, True)
+            codebook_bytes = compress_section(codebook_bytes, True)
+            coeff_meta_bytes = compress_section(coeff_meta_bytes, True)
 
         metadata_size = len(metadata_bytes)
         codebook_size = len(codebook_bytes)
@@ -238,9 +238,9 @@ class FilePacker:
             pixel_bytes = f.read(pixel_size)
         use_zstd = (is_v4 or is_lossy) and _ZSTD_AVAILABLE
         if is_v4 or is_v3 or is_lossy:
-            codebook_bytes = _decompress_section(codebook_bytes, use_zstd)
-            coeff_meta_bytes = _decompress_section(coeff_meta_bytes, use_zstd)
-            pixel_bytes = _decompress_section(pixel_bytes, use_zstd)
+            codebook_bytes = decompress_section(codebook_bytes, use_zstd)
+            coeff_meta_bytes = decompress_section(coeff_meta_bytes, use_zstd)
+            pixel_bytes = decompress_section(pixel_bytes, use_zstd)
         codebook = json.loads(codebook_bytes.decode("utf-8"))
         coeff_metadata = json.loads(coeff_meta_bytes.decode("utf-8"))
         if "num_frames" not in coeff_metadata:

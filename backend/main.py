@@ -47,7 +47,7 @@ def unique_filename(prefix: str, suffix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}{suffix}"
 
 
-def _psnr(original, reconstructed, max_val: float = 255.0) -> float:
+def psnr(original, reconstructed, max_val: float = 255.0) -> float:
     """Compute PSNR in dB. Both arrays should be same shape, uint8 or float."""
     import numpy as np
     mse = float(np.mean((np.asarray(original, dtype=np.float64) - np.asarray(reconstructed, dtype=np.float64)) ** 2))
@@ -89,7 +89,7 @@ def health():
     return {"status": "ok", "version": "1.0.0", "mode": "lossless"}
 
 
-def _safe_compressed_filename(name: str) -> bool:
+def safe_compressed_filename(name: str) -> bool:
     """Allow only compressed_<8 hex>.dcmz (e.g. compressed_73bab97a.dcmz)."""
     if not name or len(name) > 64:
         return False
@@ -103,7 +103,7 @@ def _safe_compressed_filename(name: str) -> bool:
     return len(hex_part) == 8 and all(c in "0123456789abcdef" for c in hex_part)
 
 
-def _safe_stl_compressed_filename(name: str) -> bool:
+def safe_stl_compressed_filename(name: str) -> bool:
     """Allow only stl_compressed_<8 hex>.twsc."""
     if not name or len(name) > 64:
         return False
@@ -120,7 +120,7 @@ def _safe_stl_compressed_filename(name: str) -> bool:
 @app.get("/download/compressed/{filename:path}", include_in_schema=False)
 def download_compressed(filename: str):
     """Download a compressed DICOM file (.dcmz) by name. Filename must be like compressed_xxxxxxxx.dcmz."""
-    if not _safe_compressed_filename(filename):
+    if not safe_compressed_filename(filename):
         raise HTTPException(400, "Invalid filename")
     path = COMPRESSED_DIR / filename
     if not path.is_file():
@@ -135,7 +135,7 @@ def download_compressed(filename: str):
 @app.get("/download/stl_compressed/{filename:path}", include_in_schema=False)
 def download_stl_compressed(filename: str):
     """Download a compressed STL file (.twsc) by name."""
-    if not _safe_stl_compressed_filename(filename):
+    if not safe_stl_compressed_filename(filename):
         raise HTTPException(400, "Invalid filename")
     path = STL_COMPRESSED_DIR / filename
     if not path.is_file():
@@ -290,7 +290,7 @@ async def compress_lossy(
             pixel_dec = wavelet_engine.inverse_transform(coeffs_dec)
             pixel_int = np.round(np.asarray(pixel_dec, dtype=np.float64)).astype(np.int64)
             reconstructed = quantization_engine.dequantize(pixel_int, unpacked["Q"])
-            psnr_val = _psnr(normalized, reconstructed)
+            psnr_val = psnr(normalized, reconstructed)
         except Exception:
             pass
         return {

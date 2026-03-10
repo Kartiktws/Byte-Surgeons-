@@ -7,7 +7,7 @@ import numpy as np
 from typing import Optional
 
 
-def _get_window_params(metadata_tags: Optional[dict]) -> tuple:
+def get_window_params(metadata_tags: Optional[dict]) -> tuple:
     """Extract window center and width from metadata. Returns (center, width) or (None, None)."""
     if not metadata_tags:
         return None, None
@@ -52,7 +52,7 @@ class Preprocessor:
         modality = (modality or "OT").upper()
 
         if modality == "CT":
-            center, width = _get_window_params(metadata_tags)
+            center, width = get_window_params(metadata_tags)
             if center is not None and width is not None and width > 0:
                 low = center - width / 2
                 high = center + width / 2

@@ -176,7 +176,7 @@ def stage0_deduplicate(
     return unique_vertices, triangles
 
 
-def _bbox_diagonal(vertices: np.ndarray) -> float:
+def bbox_diagonal(vertices: np.ndarray) -> float:
     """Bounding box diagonal length (float32)."""
     mn = vertices.min(axis=0)
     mx = vertices.max(axis=0)
@@ -301,7 +301,7 @@ def stage_l1_decimate_qem(
     return out_verts, out_tris
 
 
-def _morton_code(pts: np.ndarray, bbox_min: np.ndarray, scale: float) -> np.ndarray:
+def morton_code(pts: np.ndarray, bbox_min: np.ndarray, scale: float) -> np.ndarray:
     """Morton (Z-order) code for points in 3D. scale = 1/grid_step or similar."""
     p = ((pts - bbox_min) * scale).astype(np.int64)
     p = np.clip(p, 0, (1 << 10) - 1)
@@ -328,7 +328,7 @@ def stage_l3_reorder_morton(
     bbox_max = unique_vertices.max(axis=0)
     span = (bbox_max - bbox_min) + 1e-12
     scale = (1 << 10) / span
-    codes = _morton_code(unique_vertices, bbox_min, scale)
+    codes = morton_code(unique_vertices, bbox_min, scale)
     order = np.argsort(codes)
     inv_order = np.empty_like(order)
     inv_order[order] = np.arange(len(order))
@@ -336,7 +336,7 @@ def stage_l3_reorder_morton(
     reordered_triangles = inv_order[triangles]
     # Sort triangles by Morton code of centroid
     centroids = reordered_vertices[reordered_triangles].mean(axis=1)
-    tri_codes = _morton_code(centroids, bbox_min, scale)
+    tri_codes = morton_code(centroids, bbox_min, scale)
     tri_sort = np.argsort(tri_codes)
     reordered_triangles = reordered_triangles[tri_sort]
     return reordered_vertices, reordered_triangles
@@ -514,7 +514,7 @@ def compress(
     }
 
 
-def _quality_to_level(quality_level: str) -> int:
+def quality_to_level(quality_level: str) -> int:
     """Map 'high'|'med'|'low' to QUALITY_* constant."""
     q = quality_level.lower()
     if q == "high":
@@ -537,7 +537,7 @@ def compress_lossy_advanced(
     """
     input_path = Path(input_path)
     output_path = Path(output_path)
-    q_level = _quality_to_level(quality_level)
+    q_level = quality_to_level(quality_level)
 
     vertices_pt, _ = parse_stl(input_path)
     orig_tri_count = vertices_pt.shape[0]
@@ -545,7 +545,7 @@ def compress_lossy_advanced(
 
     # Epsilon welding
     all_verts = vertices_pt.reshape(-1, 3)
-    diagonal = _bbox_diagonal(all_verts)
+    diagonal = bbox_diagonal(all_verts)
     epsilon = diagonal * EPSILON_FACTOR[q_level]
     unique_vertices, triangles = stage0_weld_deduplicate(vertices_pt, epsilon)
 

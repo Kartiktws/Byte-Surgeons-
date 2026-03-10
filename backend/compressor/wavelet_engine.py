@@ -8,7 +8,7 @@ import numpy as np
 import pywt
 
 
-def _haar1d_forward_int(x: np.ndarray) -> tuple:
+def haar1d_forward_int(x: np.ndarray) -> tuple:
     """1D integer Haar lifting: (low, high) from 1D array. In-place style."""
     e = x[0::2].astype(np.int64)
     o = x[1::2].astype(np.int64)
@@ -17,7 +17,7 @@ def _haar1d_forward_int(x: np.ndarray) -> tuple:
     return low, high
 
 
-def _haar1d_inverse_int(low: np.ndarray, high: np.ndarray) -> np.ndarray:
+def haar1d_inverse_int(low: np.ndarray, high: np.ndarray) -> np.ndarray:
     """1D integer Haar inverse: reconstruct 1D from low, high."""
     e = low - (high >> 1)
     o = high + e
@@ -28,7 +28,7 @@ def _haar1d_inverse_int(low: np.ndarray, high: np.ndarray) -> np.ndarray:
     return out
 
 
-def _haar2d_one_level_int(arr: np.ndarray) -> tuple:
+def haar2d_one_level_int(arr: np.ndarray) -> tuple:
     """One level 2D integer Haar. Returns (LL, LH, HL, HH)."""
     R, C = arr.shape
     arr = arr.astype(np.int64)
@@ -36,38 +36,38 @@ def _haar2d_one_level_int(arr: np.ndarray) -> tuple:
     L_rows = np.empty((R, C // 2), dtype=np.int64)
     H_rows = np.empty((R, C // 2), dtype=np.int64)
     for i in range(R):
-        low, high = _haar1d_forward_int(arr[i, :])
+        low, high = haar1d_forward_int(arr[i, :])
         L_rows[i, :] = low
         H_rows[i, :] = high
     # Columns of L_rows -> LL, HL
     LL = np.empty((R // 2, C // 2), dtype=np.int64)
     HL = np.empty((R // 2, C // 2), dtype=np.int64)
     for j in range(C // 2):
-        low, high = _haar1d_forward_int(L_rows[:, j])
+        low, high = haar1d_forward_int(L_rows[:, j])
         LL[:, j] = low
         HL[:, j] = high
     LH = np.empty((R // 2, C // 2), dtype=np.int64)
     HH = np.empty((R // 2, C // 2), dtype=np.int64)
     for j in range(C // 2):
-        low, high = _haar1d_forward_int(H_rows[:, j])
+        low, high = haar1d_forward_int(H_rows[:, j])
         LH[:, j] = low
         HH[:, j] = high
     return LL, LH, HL, HH
 
 
-def _haar2d_one_level_inverse_int(LL: np.ndarray, LH: np.ndarray, HL: np.ndarray, HH: np.ndarray) -> np.ndarray:
+def haar2d_one_level_inverse_int(LL: np.ndarray, LH: np.ndarray, HL: np.ndarray, HH: np.ndarray) -> np.ndarray:
     """Inverse of one level 2D integer Haar."""
     R2, C2 = LL.shape
     # Reconstruct L_rows and H_rows from columns
     L_rows = np.empty((R2 * 2, C2), dtype=np.int64)
     H_rows = np.empty((R2 * 2, C2), dtype=np.int64)
     for j in range(C2):
-        L_rows[:, j] = _haar1d_inverse_int(LL[:, j], HL[:, j])
-        H_rows[:, j] = _haar1d_inverse_int(LH[:, j], HH[:, j])
+        L_rows[:, j] = haar1d_inverse_int(LL[:, j], HL[:, j])
+        H_rows[:, j] = haar1d_inverse_int(LH[:, j], HH[:, j])
     # Reconstruct rows
     out = np.empty((R2 * 2, C2 * 2), dtype=np.int64)
     for i in range(R2 * 2):
-        out[i, :] = _haar1d_inverse_int(L_rows[i, :], H_rows[i, :])
+        out[i, :] = haar1d_inverse_int(L_rows[i, :], H_rows[i, :])
     return out
 
 
@@ -87,7 +87,7 @@ class WaveletEngine:
         coeffs_list = []
         current = arr
         for _ in range(self.LEVELS):
-            LL, LH, HL, HH = _haar2d_one_level_int(current)
+            LL, LH, HL, HH = haar2d_one_level_int(current)
             coeffs_list.append((LH, HL, HH))
             current = LL
         return {
@@ -107,7 +107,7 @@ class WaveletEngine:
         for level in range(self.LEVELS - 1, -1, -1):
             d = details[level]
             LH, HL, HH = d["V"], d["H"], d["D"]
-            current = _haar2d_one_level_inverse_int(current, LH, HL, HH)
+            current = haar2d_one_level_inverse_int(current, LH, HL, HH)
         original_shape = coefficients_dict["original_shape"]
         original_dtype = np.dtype(coefficients_dict["original_dtype"])
         out = np.clip(current, np.iinfo(original_dtype).min, np.iinfo(original_dtype).max)

@@ -16,21 +16,21 @@ except ImportError:
     _ZSTD_AVAILABLE = False
 
 
-def _compress_zstd(data: bytes, level: int = 22) -> bytes:
+def compress_zstd(data: bytes, level: int = 22) -> bytes:
     if not _ZSTD_AVAILABLE:
         return zlib.compress(data, level=9)
     cctx = zstd.ZstdCompressor(level=min(level, 22))
     return cctx.compress(data)
 
 
-def _decompress_zstd(data: bytes) -> bytes:
+def decompress_zstd(data: bytes) -> bytes:
     if not _ZSTD_AVAILABLE:
         raise ValueError("zstandard not installed")
     dctx = zstd.ZstdDecompressor()
     return dctx.decompress(data)
 
 
-def _is_zstd(data: bytes) -> bool:
+def is_zstd(data: bytes) -> bool:
     return len(data) >= 4 and data[:4] == ZSTD_MAGIC
 
 
@@ -52,7 +52,7 @@ class MetadataHandler:
         )
         utf8_bytes = json_str.encode("utf-8")
         if _ZSTD_AVAILABLE:
-            compressed = _compress_zstd(utf8_bytes, level=22)
+            compressed = compress_zstd(utf8_bytes, level=22)
         else:
             compressed = zlib.compress(utf8_bytes, level=9)
         return compressed
@@ -62,8 +62,8 @@ class MetadataHandler:
         Decompress bytes back to metadata_tags dict.
         Auto-detects zstd (magic 28 B5 2F FD) vs zlib.
         """
-        if _is_zstd(compressed_bytes):
-            decompressed = _decompress_zstd(compressed_bytes)
+        if is_zstd(compressed_bytes):
+            decompressed = decompress_zstd(compressed_bytes)
         else:
             decompressed = zlib.decompress(compressed_bytes)
         json_str = decompressed.decode("utf-8")
