@@ -18,16 +18,34 @@ import numpy as np
 import zstandard
 from dahuffman import HuffmanCodec
 
+try:
+    import open3d as o3d
+    _HAS_OPEN3D = True
+except ImportError:
+    _HAS_OPEN3D = False
+
 # -----------------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------------
 MAGIC = b"TWSC"
 VERSION = 1
+VERSION_LOSSY_ADVANCED = 2  # Lossy pipeline with welding, QEM, reordering
 MODE_LOSSLESS = 0
 MODE_LOSSY = 1
 DEFAULT_QUANTIZATION_BITS = 12
 ZSTD_LEVEL = 19
-HEADER_SIZE = 4 + 1 + 1 + 1 + 4 + 4 + 24  # 39 bytes: magic + version + mode + qbits + tri + vert + 6*float
+HEADER_SIZE = 4 + 1 + 1 + 1 + 4 + 4 + 24  # 39 bytes: v1
+# v2: magic(4) + version(1) + mode(1) + quality(1) + qbits(1) + tri(4) + vert(4) + orig_tri(4) + orig_vert(4) + bbox(24) = 48
+HEADER_SIZE_V2 = 48
+
+# Quality level: high=0, med=1, low=2 (stored as uint8 in header)
+QUALITY_HIGH, QUALITY_MED, QUALITY_LOW = 0, 1, 2
+# Epsilon = bbox_diagonal * factor (for welding)
+EPSILON_FACTOR = {QUALITY_HIGH: 1e-5, QUALITY_MED: 1e-4, QUALITY_LOW: 1e-3}
+# Keep this fraction of triangles after QEM decimation
+DECIMATION_KEEP_RATIO = {QUALITY_HIGH: 0.70, QUALITY_MED: 0.45, QUALITY_LOW: 0.25}
+# Quantization bits per axis
+QUANTIZATION_BITS = {QUALITY_HIGH: 12, QUALITY_MED: 10, QUALITY_LOW: 8}
 
 # Binary STL: 80-byte header + 4-byte triangle count + 50 bytes per triangle
 STL_BINARY_TRIANGLE_SIZE = 50  # 12 (normal) + 36 (9 floats) + 2 (attr)
@@ -158,6 +176,70 @@ def stage0_deduplicate(
     return unique_vertices, triangles
 
 
+def _bbox_diagonal(vertices: np.ndarray) -> float:
+    """Bounding box diagonal length (float32)."""
+    mn = vertices.min(axis=0)
+    mx = vertices.max(axis=0)
+    return float(np.sqrt(np.sum((mx - mn) ** 2)))
+
+
+def stage0_weld_deduplicate(
+    vertices_per_triangle: np.ndarray,
+    epsilon: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Stage 0 (lossy): Epsilon welding + deduplication.
+    Merge vertices within spatial distance epsilon, then build unique_vertices and triangles.
+    """
+    if epsilon <= 0:
+        return stage0_deduplicate(vertices_per_triangle)
+    # Flatten to all vertex positions
+    all_verts = vertices_per_triangle.reshape(-1, 3)
+    bbox_min = all_verts.min(axis=0)
+    # Grid cell size = epsilon; cell index = floor((v - bbox_min) / epsilon)
+    cells = np.floor((all_verts - bbox_min) / (epsilon + 1e-12)).astype(np.int64)
+    # Map cell tuple -> list of vertex indices in that cell
+    cell_to_verts: Dict[Tuple[int, int, int], List[int]] = {}
+    for i in range(len(all_verts)):
+        key = (int(cells[i, 0]), int(cells[i, 1]), int(cells[i, 2]))
+        if key not in cell_to_verts:
+            cell_to_verts[key] = []
+        cell_to_verts[key].append(i)
+    # Representative per vertex: index into unique list (by centroid of cell)
+    unique_list: List[np.ndarray] = []
+    old_index_to_new: Dict[int, int] = {}
+    for cell_key, indices in cell_to_verts.items():
+        pts = all_verts[indices]
+        centroid = pts.mean(axis=0).astype(np.float32)
+        new_idx = len(unique_list)
+        unique_list.append(centroid)
+        for idx in indices:
+            old_index_to_new[idx] = new_idx
+    unique_vertices = np.array(unique_list, dtype=np.float32)
+    # Remap triangle indices: each of 3*N vertex indices -> new index
+    N = vertices_per_triangle.shape[0]
+    triangles = np.zeros((N, 3), dtype=np.int32)
+    for i in range(N):
+        for j in range(3):
+            flat_idx = i * 3 + j
+            triangles[i, j] = old_index_to_new[flat_idx]
+    # Remove degenerate triangles (all 3 indices equal)
+    non_degen = (triangles[:, 0] != triangles[:, 1]) | (triangles[:, 1] != triangles[:, 2]) | (triangles[:, 0] != triangles[:, 2])
+    triangles = triangles[non_degen]
+    # Re-index so that only referenced vertices are kept
+    used = np.zeros(len(unique_vertices), dtype=bool)
+    used[triangles.ravel()] = True
+    old_to_new = np.full(len(unique_vertices), -1, dtype=np.int32)
+    new_idx = 0
+    for i in range(len(unique_vertices)):
+        if used[i]:
+            old_to_new[i] = new_idx
+            new_idx += 1
+    unique_vertices = unique_vertices[used]
+    triangles = old_to_new[triangles]
+    return unique_vertices, triangles
+
+
 def stage2_quantize(
     unique_vertices: np.ndarray,
     bits: int,
@@ -193,6 +275,71 @@ def stage2_quantize(
         [np.round(qx).astype(np.int64), np.round(qy).astype(np.int64), np.round(qz).astype(np.int64)]
     )
     return quantized, bbox
+
+
+def stage_l1_decimate_qem(
+    unique_vertices: np.ndarray,
+    triangles: np.ndarray,
+    target_keep_ratio: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Stage L1: Quadric Error Metrics decimation. Reduces triangle count.
+    Requires open3d. If not available, returns inputs unchanged.
+    """
+    if not _HAS_OPEN3D or target_keep_ratio >= 1.0:
+        return unique_vertices, triangles
+    N = triangles.shape[0]
+    target_n = max(4, int(N * target_keep_ratio))
+    if target_n >= N:
+        return unique_vertices, triangles
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(unique_vertices.astype(np.float64))
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    simplified = mesh.simplify_quadric_decimation(target_n)
+    out_verts = np.asarray(simplified.vertices, dtype=np.float32)
+    out_tris = np.asarray(simplified.triangles, dtype=np.int32)
+    return out_verts, out_tris
+
+
+def _morton_code(pts: np.ndarray, bbox_min: np.ndarray, scale: float) -> np.ndarray:
+    """Morton (Z-order) code for points in 3D. scale = 1/grid_step or similar."""
+    p = ((pts - bbox_min) * scale).astype(np.int64)
+    p = np.clip(p, 0, (1 << 10) - 1)
+    x, y, z = p[:, 0], p[:, 1], p[:, 2]
+    def split_by_1(a):
+        a = a & 0x3fffff
+        a = (a | (a << 32)) & 0x1f00000000ffff
+        a = (a | (a << 16)) & 0x1f0000ff0000ff
+        a = (a | (a << 8)) & 0x100f00f00f00f00f
+        a = (a | (a << 4)) & 0x10c30c30c30c30c3
+        a = (a | (a << 2)) & 0x1249249249249249
+        return a
+    return split_by_1(x) | (split_by_1(y) << 1) | (split_by_1(z) << 2)
+
+
+def stage_l3_reorder_morton(
+    unique_vertices: np.ndarray,
+    triangles: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Stage L3: Reorder vertices by Morton (Z-order) curve for coherence; sort triangles by centroid Morton.
+    """
+    bbox_min = unique_vertices.min(axis=0)
+    bbox_max = unique_vertices.max(axis=0)
+    span = (bbox_max - bbox_min) + 1e-12
+    scale = (1 << 10) / span
+    codes = _morton_code(unique_vertices, bbox_min, scale)
+    order = np.argsort(codes)
+    inv_order = np.empty_like(order)
+    inv_order[order] = np.arange(len(order))
+    reordered_vertices = unique_vertices[order]
+    reordered_triangles = inv_order[triangles]
+    # Sort triangles by Morton code of centroid
+    centroids = reordered_vertices[reordered_triangles].mean(axis=1)
+    tri_codes = _morton_code(centroids, bbox_min, scale)
+    tri_sort = np.argsort(tri_codes)
+    reordered_triangles = reordered_triangles[tri_sort]
+    return reordered_vertices, reordered_triangles
 
 
 def stage1b_delta_encode(
@@ -367,27 +514,138 @@ def compress(
     }
 
 
+def _quality_to_level(quality_level: str) -> int:
+    """Map 'high'|'med'|'low' to QUALITY_* constant."""
+    q = quality_level.lower()
+    if q == "high":
+        return QUALITY_HIGH
+    if q == "med" or q == "medium":
+        return QUALITY_MED
+    if q == "low":
+        return QUALITY_LOW
+    return QUALITY_MED
+
+
+def compress_lossy_advanced(
+    input_path: str | Path,
+    output_path: str | Path,
+    quality_level: Literal["high", "med", "low"] = "med",
+) -> Dict[str, Any]:
+    """
+    STL lossy pipeline: Parse -> Weld -> QEM decimate -> Quantize -> Morton reorder -> Delta -> Huffman -> ZSTD.
+    Writes .twsc with version 2 header (48 bytes) including orig_tri_count, orig_vert_count, quality_level.
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    q_level = _quality_to_level(quality_level)
+
+    vertices_pt, _ = parse_stl(input_path)
+    orig_tri_count = vertices_pt.shape[0]
+    orig_vert_count = vertices_pt.shape[0] * 3  # before dedup
+
+    # Epsilon welding
+    all_verts = vertices_pt.reshape(-1, 3)
+    diagonal = _bbox_diagonal(all_verts)
+    epsilon = diagonal * EPSILON_FACTOR[q_level]
+    unique_vertices, triangles = stage0_weld_deduplicate(vertices_pt, epsilon)
+
+    # QEM decimation
+    keep_ratio = DECIMATION_KEEP_RATIO[q_level]
+    unique_vertices, triangles = stage_l1_decimate_qem(unique_vertices, triangles, keep_ratio)
+
+    # Quantization
+    qbits = QUANTIZATION_BITS[q_level]
+    quantized, bbox = stage2_quantize(unique_vertices, qbits)
+    # Reorder for delta coherence (stage_l3 expects float; we pass quantized as float for ordering)
+    verts_f = quantized.astype(np.float64)
+    reordered_verts, reordered_triangles = stage_l3_reorder_morton(verts_f, triangles)
+    reordered_verts = reordered_verts.astype(np.int64)
+
+    # Delta + Huffman + ZSTD (same as existing lossy path)
+    x_d, y_d, z_d, idx_d = stage1b_delta_encode(reordered_verts, reordered_triangles, lossless=False)
+    x_b, y_b, z_b, i_b, cx, cy, cz, ci = stage1a_huffman_encode(x_d, y_d, z_d, idx_d)
+    payload = build_payload(cx, cy, cz, ci, x_b, y_b, z_b, i_b)
+    compressed_payload = stage4_zstd_compress(payload)
+
+    # Version 2 header: magic(4) version(1) mode(1) quality(1) qbits(1) tri(4) vert(4) orig_tri(4) orig_vert(4) bbox(24)
+    header = struct.pack(
+        "<4sBBBBIIII",
+        MAGIC,
+        VERSION_LOSSY_ADVANCED,
+        MODE_LOSSY,
+        q_level,
+        qbits,
+        reordered_triangles.shape[0],
+        reordered_verts.shape[0],
+        orig_tri_count,
+        orig_vert_count,
+    )
+    header += struct.pack("<6f", *bbox.tolist())
+    full = header + compressed_payload
+    output_path.write_bytes(full)
+
+    input_size = input_path.stat().st_size
+    output_size = len(full)
+    ratio_pct = (1 - output_size / input_size) * 100 if input_size > 0 else 0.0
+    return {
+        "input_size": input_size,
+        "output_size": output_size,
+        "compression_ratio_percent": round(ratio_pct, 2),
+        "mode": "lossy",
+        "quality_level": quality_level,
+        "original_triangle_count": orig_tri_count,
+        "triangle_count": int(reordered_triangles.shape[0]),
+        "original_vertex_count": orig_vert_count,
+        "unique_vertex_count": int(reordered_verts.shape[0]),
+    }
+
+
 # -----------------------------------------------------------------------------
 # Decompression
 # -----------------------------------------------------------------------------
 
 
 def read_header(data: bytes) -> Dict[str, Any]:
-    """Parse .twsc header. Returns dict with mode, bits, tri_count, vert_count, bbox."""
-    if len(data) < HEADER_SIZE or data[:4] != MAGIC:
+    """Parse .twsc header. Supports v1 (39 bytes) and v2 (48 bytes). Returns dict with header_size, mode, bits, tri_count, vert_count, bbox, and optionally orig_* and quality_level."""
+    if len(data) < 5 or data[:4] != MAGIC:
         raise ValueError("Invalid TWSC file or header too short")
-    version, mode, qbits, tri_count, vert_count = struct.unpack_from("<BBBII", data, 4)
-    if version != VERSION:
-        raise ValueError(f"Unsupported TWSC version {version}")
-    bbox = struct.unpack_from("<6f", data, 4 + 1 + 1 + 1 + 4 + 4)  # offset 15
-    return {
-        "version": version,
-        "mode": mode,
-        "quantization_bits": qbits,
-        "triangle_count": tri_count,
-        "vertex_count": vert_count,
-        "bbox": np.array(bbox, dtype=np.float32),
-    }
+    version = struct.unpack_from("<B", data, 4)[0]
+    if version == VERSION:
+        if len(data) < HEADER_SIZE:
+            raise ValueError("TWSC v1 header truncated")
+        _, mode, qbits, tri_count, vert_count = struct.unpack_from("<BBBII", data, 4)
+        bbox = struct.unpack_from("<6f", data, 4 + 1 + 1 + 1 + 4 + 4)
+        return {
+            "version": version,
+            "header_size": HEADER_SIZE,
+            "mode": mode,
+            "quantization_bits": qbits,
+            "triangle_count": tri_count,
+            "vertex_count": vert_count,
+            "bbox": np.array(bbox, dtype=np.float32),
+            "original_triangle_count": tri_count,
+            "original_vertex_count": vert_count,
+        }
+    if version == VERSION_LOSSY_ADVANCED:
+        if len(data) < HEADER_SIZE_V2:
+            raise ValueError("TWSC v2 header truncated")
+        _, mode, quality, qbits, tri_count, vert_count, orig_tri, orig_vert = struct.unpack_from(
+            "<BBBBIIII", data, 4
+        )
+        bbox = struct.unpack_from("<6f", data, 4 + 1 + 1 + 1 + 1 + 4 + 4 + 4 + 4)
+        return {
+            "version": version,
+            "header_size": HEADER_SIZE_V2,
+            "mode": mode,
+            "quantization_bits": qbits,
+            "triangle_count": tri_count,
+            "vertex_count": vert_count,
+            "bbox": np.array(bbox, dtype=np.float32),
+            "original_triangle_count": orig_tri,
+            "original_vertex_count": orig_vert,
+            "quality_level": quality,
+        }
+    raise ValueError(f"Unsupported TWSC version {version}")
 
 
 def decompress_zstd(compressed: bytes) -> bytes:
@@ -417,7 +675,7 @@ def decompress(input_path: str | Path, output_path: str | Path) -> None:
     output_path = Path(output_path)
     data = input_path.read_bytes()
     info = read_header(data)
-    payload_compressed = data[HEADER_SIZE:]
+    payload_compressed = data[info["header_size"]:]
     payload = decompress_zstd(payload_compressed)
     offset = 0
     codecs = []

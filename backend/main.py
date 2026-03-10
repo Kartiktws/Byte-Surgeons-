@@ -25,7 +25,11 @@ from backend.compressor.file_packer import (
 from backend.compressor.preprocessor import Preprocessor
 from backend.compressor.quantization_engine import QuantizationEngine, default_q_for_modality
 from backend.compressor.thresholder import Thresholder
-from backend.compressor.stl_compressor import compress as stl_compress, decompress as stl_decompress
+from backend.compressor.stl_compressor import (
+    compress as stl_compress,
+    decompress as stl_decompress,
+    compress_lossy_advanced as stl_compress_lossy_advanced,
+)
 
 # Output folders: compressed and decompressed files saved here (paths returned to user)
 COMPRESSED_DIR = Path(__file__).resolve().parent / "compressed_output"
@@ -377,7 +381,8 @@ async def stl_compress_api(
     bits: int = Form(12),
 ):
     """
-    Upload a .stl file; compress to .twsc (lossless or lossy), save to stl_compressed_output, return stats + path.
+    Upload a .stl file; compress to .twsc (lossless or simple lossy), save to stl_compressed_output, return stats + path.
+    For advanced lossy (weld + QEM + reorder), use POST /stl/compress/lossy.
     """
     if not file.filename or not file.filename.lower().endswith(".stl"):
         raise HTTPException(400, "Only .stl files are accepted")
@@ -403,6 +408,51 @@ async def stl_compress_api(
             "mode": result["mode"],
             "triangle_count": result["triangle_count"],
             "unique_vertex_count": result["unique_vertex_count"],
+            "output_file": out_filename,
+            "output_path": str(out_path),
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/stl/compress/lossy")
+async def stl_compress_lossy_api(
+    file: UploadFile = File(...),
+    quality_level: str = Form("med"),
+):
+    """
+    Upload a .stl file; run advanced lossy pipeline (epsilon weld, QEM decimation, quantization, Morton reorder),
+    save .twsc to stl_compressed_output. quality_level: 'high' (70% tris, 12-bit), 'med' (45%, 10-bit), 'low' (25%, 8-bit).
+    """
+    if not file.filename or not file.filename.lower().endswith(".stl"):
+        raise HTTPException(400, "Only .stl files are accepted")
+    if quality_level not in ("high", "med", "medium", "low"):
+        raise HTTPException(400, "quality_level must be 'high', 'med', or 'low'")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        stl_path = Path(tmpdir) / "input.stl"
+        content = await file.read()
+        stl_path.write_bytes(content)
+        original_size = len(content)
+        out_filename = unique_filename("stl_compressed", ".twsc")
+        out_path = STL_COMPRESSED_DIR / out_filename
+        result = stl_compress_lossy_advanced(
+            str(stl_path), str(out_path), quality_level=quality_level
+        )
+        compressed_size = out_path.stat().st_size
+        return {
+            "status": "success",
+            "original_size_bytes": result["input_size"],
+            "original_size_kb": round(original_size / 1024, 2),
+            "compressed_size_bytes": result["output_size"],
+            "compressed_size_kb": round(compressed_size / 1024, 2),
+            "compression_ratio_percent": result["compression_ratio_percent"],
+            "mode": result["mode"],
+            "quality_level": result["quality_level"],
+            "original_triangle_count": result["original_triangle_count"],
+            "decimated_triangle_count": result["triangle_count"],
+            "original_vertex_count": result["original_vertex_count"],
+            "decimated_vertex_count": result["unique_vertex_count"],
             "output_file": out_filename,
             "output_path": str(out_path),
         }
