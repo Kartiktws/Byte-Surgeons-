@@ -31,6 +31,15 @@ class QuantizationEngine:
     Store Q in header for exact dequantization (pixel_approx = pixel_q * Q + Q//2).
     """
 
+    def quantize_frame(self, pixel_2d: np.ndarray, Q: int) -> np.ndarray:
+        """
+        Quantize a single 2D frame (uint8 or int) by integer division with Q.
+        Returns 2D int64 for that frame only. Use this to avoid full-volume int64 allocation.
+        """
+        if Q < 1:
+            Q = 1
+        return np.asarray(pixel_2d, dtype=np.int64) // Q
+
     def quantize(
         self,
         pixel_array: np.ndarray,
@@ -40,6 +49,7 @@ class QuantizationEngine:
         """
         Quantize pixel array (uint8 or int) by integer division with Q.
         Returns (quantized array as int64, metadata dict with Q and original_dtype).
+        For large volumes prefer building frame-by-frame via quantize_frame() to avoid OOM.
         """
         if Q < 1:
             Q = 1

@@ -114,8 +114,8 @@ class WaveletEngine:
         return out.astype(original_dtype)
 
     def forward_2d(self, pixel_2d: np.ndarray) -> dict:
-        """Single 2D frame: Haar decomposition. Returns one coefficient dict."""
-        arr = np.asarray(pixel_2d, dtype=np.float64)
+        """Single 2D frame: Haar decomposition. Returns one coefficient dict. Uses float32 to reduce per-frame allocation."""
+        arr = np.asarray(pixel_2d, dtype=np.float32)
         coeffs = pywt.wavedec2(arr, self.WAVELET, level=self.LEVELS)
         cA3 = coeffs[0]
         details = []
