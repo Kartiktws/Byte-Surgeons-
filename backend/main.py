@@ -2,10 +2,13 @@
 FastAPI application for lossless DICOM compression/decompression.
 """
 
+import gc
+import os
 import tempfile
 import uuid
 from pathlib import Path
 
+import bitarray
 import numpy as np
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
@@ -48,9 +51,9 @@ def unique_filename(prefix: str, suffix: str) -> str:
 
 
 def psnr(original, reconstructed, max_val: float = 255.0) -> float:
-    """Compute PSNR in dB. Both arrays should be same shape, uint8 or float."""
+    """Compute PSNR in dB. Both arrays should be same shape, uint8 or float. Uses float32 to avoid OOM on large volumes."""
     import numpy as np
-    mse = float(np.mean((np.asarray(original, dtype=np.float64) - np.asarray(reconstructed, dtype=np.float64)) ** 2))
+    mse = float(np.mean((np.asarray(original, dtype=np.float32) - np.asarray(reconstructed, dtype=np.float32)) ** 2))
     if mse <= 0:
         return 99.0
     return round(10 * np.log10(max_val ** 2 / mse), 2)
@@ -238,24 +241,63 @@ async def compress_lossy(
         rows, cols = data["rows"], data["cols"]
         bits_original = data.get("bits", 16)
 
-        # Step 1: Preprocess (window + rescale to uint8)
-        normalized = preprocessor.normalize(pixel_array, modality, metadata_tags)
-        # Step 2: Quantize
+        # ── Single-pass streaming lossy compression ──
+        # Pipeline runs once per frame. Symbols saved to a temp file so we
+        # don't recompute the pipeline and don't hold all symbols in RAM.
+        global_stats = preprocessor.get_global_stats(pixel_array, modality, metadata_tags)
+        n_frames = pixel_array.shape[0] if pixel_array.ndim == 3 else 1
         q_val = int(Q) if Q is not None else default_q_for_modality(modality)
         if q_val < 1:
             q_val = 1
-        quantized, _ = quantization_engine.quantize(normalized, q_val, modality)
-        quantized_float = quantized.astype("float64")
-        # Step 3: Wavelet transform (float path)
-        coeffs_multi = wavelet_engine.forward_transform(quantized_float)
-        # Step 4: Threshold
         thresh = max(0.001, min(1.0, float(threshold_pct)))
-        coeffs_thresholded = thresholder.apply_multi(coeffs_multi, thresh)
-        # Step 5: Metadata compression
+
+        # Single pass: process each frame once, save symbols to temp file, count frequencies with np.unique
+        sym_tmp = os.path.join(tmpdir, "symbols.bin")
+        freq: dict = {}
+        frame_metadata_list = []
+        sym_lengths = []
+        with open(sym_tmp, "wb") as sf:
+            for i in range(n_frames):
+                fn = preprocessor.normalize_frame(pixel_array[i], global_stats, modality)
+                qf = quantization_engine.quantize_frame(fn, q_val)
+                wf = wavelet_engine.forward_2d(qf)
+                tf = thresholder.apply(wf, thresh)
+                symbols = huffman_engine.frame_to_symbols(tf)
+                frame_metadata_list.append(huffman_engine.build_coeff_metadata(tf))
+                sf.write(symbols.tobytes())
+                sym_lengths.append(len(symbols))
+                uvals, ucounts = np.unique(symbols, return_counts=True)
+                for v, c in zip(uvals.tolist(), ucounts.tolist()):
+                    freq[v] = freq.get(v, 0) + c
+                del fn, qf, wf, tf, symbols, uvals, ucounts
+        gc.collect()
+
+        codebook = huffman_engine.build_codebook(freq)
+        del freq
+        gc.collect()
+
+        # Encode from temp file: read each frame's symbols back, encode with codebook
+        ba = bitarray.bitarray()
+        with open(sym_tmp, "rb") as sf:
+            for length in sym_lengths:
+                symbols = np.frombuffer(sf.read(length * 8), dtype=np.int64)
+                ba.extend("".join(codebook[int(v)] for v in symbols.tolist()))
+                del symbols
+        os.remove(sym_tmp)
+        gc.collect()
+
+        pixel_bytes = ba.tobytes()
+        del ba
+        gc.collect()
+
+        coeff_metadata = {
+            "num_frames": n_frames,
+            "frames": frame_metadata_list,
+            "integer": False,
+            "delta_encoded": False,
+        }
+
         metadata_bytes = metadata_handler.compress(metadata_tags)
-        # Step 6: Huffman encode coefficients
-        pixel_bytes, codebook, coeff_metadata = huffman_engine.encode(coeffs_thresholded)
-        # Step 7: Pack lossy
         out_filename = unique_filename("compressed", ".dcmz")
         out_path = COMPRESSED_DIR / out_filename
         file_packer.pack_lossy(
@@ -272,27 +314,45 @@ async def compress_lossy(
             wavelet_levels=3,
             threshold_pct=thresh,
         )
+        del pixel_bytes
+        gc.collect()
+
         compressed_size = out_path.stat().st_size
         ratio_pct = (
             round((1 - compressed_size / original_size) * 100, 2)
             if original_size > 0 else 0.0
         )
-        # Optional: round-trip decode to compute PSNR
+
+        # PSNR: only compute for small volumes (<=50 frames) to avoid long wait
         psnr_val = None
-        try:
-            unpacked = file_packer.unpack(str(out_path))
-            meta_dec = metadata_handler.decompress(unpacked["metadata_bytes"])
-            coeffs_dec = huffman_engine.decode(
-                unpacked["pixel_bytes"],
-                unpacked["codebook"],
-                unpacked["coeff_metadata"],
-            )
-            pixel_dec = wavelet_engine.inverse_transform(coeffs_dec)
-            pixel_int = np.round(np.asarray(pixel_dec, dtype=np.float64)).astype(np.int64)
-            reconstructed = quantization_engine.dequantize(pixel_int, unpacked["Q"])
-            psnr_val = psnr(normalized, reconstructed)
-        except Exception:
-            pass
+        if n_frames <= 50:
+            try:
+                unpacked = file_packer.unpack(str(out_path))
+                coeffs_dec = huffman_engine.decode(
+                    unpacked["pixel_bytes"],
+                    unpacked["codebook"],
+                    unpacked["coeff_metadata"],
+                )
+                mse_sum = 0.0
+                n_pix = 0
+                dec_Q = unpacked["Q"]
+                for i in range(coeffs_dec["num_frames"]):
+                    fd = wavelet_engine.inverse_2d(coeffs_dec["frames"][i])
+                    coeffs_dec["frames"][i] = None
+                    fi = np.round(np.asarray(fd, dtype=np.float32)).astype(np.int64)
+                    rec_i = quantization_engine.dequantize(fi, dec_Q)
+                    norm_i = preprocessor.normalize_frame(pixel_array[i], global_stats, modality)
+                    diff = norm_i.astype(np.float32) - rec_i.astype(np.float32)
+                    mse_sum += float(np.sum(diff * diff))
+                    n_pix += norm_i.size
+                    del fd, fi, rec_i, norm_i, diff
+                del coeffs_dec, unpacked
+                gc.collect()
+                if n_pix > 0:
+                    mse = mse_sum / n_pix
+                    psnr_val = round(10 * np.log10(255.0 ** 2 / mse), 2) if mse > 0 else 99.0
+            except Exception:
+                pass
         return {
             "status": "success",
             "num_frames": num_frames,
@@ -334,10 +394,19 @@ async def decompress(file: UploadFile = File(...)):
                 unpacked["codebook"],
                 unpacked["coeff_metadata"],
             )
-            pixel_dec = wavelet_engine.inverse_transform(coefficients)
-            pixel_int = np.round(np.asarray(pixel_dec, dtype=np.float64)).astype(np.int64)
+            num_f = coefficients["num_frames"]
+            r0, c0 = coefficients["frames"][0]["original_shape"]
+            pixel_array = np.empty((num_f, r0, c0), dtype=np.uint8)
+            Q = unpacked["Q"]
+            for i in range(num_f):
+                frame_dec = wavelet_engine.inverse_2d(coefficients["frames"][i])
+                coefficients["frames"][i] = None  # free decoded coeffs immediately
+                frame_int = np.round(np.asarray(frame_dec, dtype=np.float32)).astype(np.int64)
+                pixel_array[i] = quantization_engine.dequantize(frame_int, Q)
+                del frame_dec, frame_int
+            del coefficients
+            gc.collect()
             print("Step 4/4: Dequantize...")
-            pixel_array = quantization_engine.dequantize(pixel_int, unpacked["Q"])
             # Override bits to 8 for lossy output
             metadata_tags["0028,0100"] = {"v": "8", "vr": "US"}
             metadata_tags["0028,0101"] = {"v": "8", "vr": "US"}
